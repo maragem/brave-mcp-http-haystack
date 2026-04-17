@@ -4,49 +4,37 @@
  * Architecture:
  *   Internet → proxy.mjs (Bearer auth check) → localhost:BRAVE_PORT (Brave MCP)
  *
- * The Brave MCP server (@brave/brave-search-mcp-server) runs on an internal port
- * with no authentication. This proxy sits in front of it, rejects requests without
- * a valid Bearer token, and forwards everything else unchanged — preserving SSE
- * streaming by piping the response directly without buffering.
- *
  * Environment variables:
- *   MCP_API_KEY    — Bearer token clients must send (required in production)
- *   PORT           — Public port this proxy listens on (injected by Railway, default 8080)
- *   BRAVE_PORT     — Internal port the Brave MCP server runs on (default 3100)
+ *   MCP_API_KEY  — Bearer token clients must send (required in production)
+ *   PORT         — Public port this proxy listens on (injected by Railway, default 8080)
+ *   BRAVE_PORT   — Internal port the Brave MCP server runs on (default 3100)
  */
 
-import http from "http";
-import { createServer } from "http";
-import { request as httpRequest } from "http";
+import { createServer, request as httpRequest } from "http";
 import crypto from "crypto";
 
 const PUBLIC_PORT = parseInt(process.env.PORT ?? "8080", 10);
-const BRAVE_PORT = parseInt(process.env.BRAVE_PORT ?? "3100", 10);
-const API_KEY = process.env.MCP_API_KEY ?? "";
+const BRAVE_PORT  = parseInt(process.env.BRAVE_PORT ?? "3100", 10);
+const API_KEY     = process.env.MCP_API_KEY ?? "";
 
 if (!API_KEY) {
   console.warn(
     "[proxy] WARNING: MCP_API_KEY is not set. " +
-      "The proxy is running WITHOUT authentication. " +
-      "Set MCP_API_KEY in Railway Variables before exposing to the internet."
+    "Running WITHOUT authentication. Set MCP_API_KEY in Railway Variables."
   );
 }
 
-// ── Auth check ────────────────────────────────────────────────────────────────
+// ── Auth ──────────────────────────────────────────────────────────────────────
 
 function isAuthorised(req) {
-  if (!API_KEY) return true; // dev mode — no key configured
+  if (!API_KEY) return true;
   const auth = req.headers["authorization"] ?? "";
   if (!auth.startsWith("Bearer ")) return false;
   const token = auth.slice(7).trim();
-  // Constant-time comparison to prevent timing attacks
   try {
-    return crypto.timingSafeEqual(
-      Buffer.from(token),
-      Buffer.from(API_KEY)
-    );
+    return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(API_KEY));
   } catch {
-    return false; // length mismatch throws — treat as invalid
+    return false; // length mismatch — reject
   }
 }
 
@@ -59,10 +47,46 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
-// ── Proxy logic ───────────────────────────────────────────────────────────────
+// ── Proxy with retry on ECONNREFUSED ─────────────────────────────────────────
+
+function forwardRequest(req, res, retries = 5, delayMs = 1000) {
+  const options = {
+    hostname: "127.0.0.1",
+    port: BRAVE_PORT,
+    path: req.url,
+    method: req.method,
+    headers: { ...req.headers, host: `127.0.0.1:${BRAVE_PORT}` },
+  };
+
+  const upstream = httpRequest(options, (upstreamRes) => {
+    res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+    upstreamRes.pipe(res, { end: true });
+  });
+
+  upstream.on("error", (err) => {
+    if (err.code === "ECONNREFUSED" && retries > 0) {
+      // Brave server not yet accepting — retry after delay
+      console.warn(`[proxy] upstream ECONNREFUSED, retrying in ${delayMs}ms (${retries} left)`);
+      setTimeout(() => {
+        if (!res.headersSent) forwardRequest(req, res, retries - 1, delayMs * 1.5);
+      }, delayMs);
+    } else {
+      console.error("[proxy] upstream error:", err.message);
+      if (!res.headersSent) {
+        sendJson(res, 502, { error: "Upstream unavailable", detail: err.message });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  req.pipe(upstream, { end: true });
+}
+
+// ── Server ────────────────────────────────────────────────────────────────────
 
 const proxy = createServer((req, res) => {
-  // Health check — always public, no auth
+  // Health — always public
   if (req.url === "/health" && req.method === "GET") {
     return sendJson(res, 200, {
       status: "healthy",
@@ -78,30 +102,7 @@ const proxy = createServer((req, res) => {
     });
   }
 
-  // Forward to Brave MCP server — pipe directly so SSE streaming is preserved
-  const options = {
-    hostname: "127.0.0.1",
-    port: BRAVE_PORT,
-    path: req.url,
-    method: req.method,
-    headers: { ...req.headers, host: `127.0.0.1:${BRAVE_PORT}` },
-  };
-
-  const upstream = httpRequest(options, (upstreamRes) => {
-    res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-    upstreamRes.pipe(res, { end: true });
-  });
-
-  upstream.on("error", (err) => {
-    console.error("[proxy] upstream error:", err.message);
-    if (!res.headersSent) {
-      sendJson(res, 502, { error: "Upstream unavailable", detail: err.message });
-    } else {
-      res.end();
-    }
-  });
-
-  req.pipe(upstream, { end: true });
+  forwardRequest(req, res);
 });
 
 proxy.listen(PUBLIC_PORT, "0.0.0.0", () => {
