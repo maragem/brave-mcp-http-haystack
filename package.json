@@ -1,0 +1,16 @@
+{
+  "name": "brave-search-mcp-railway",
+  "version": "1.0.0",
+  "description": "Brave Search MCP Server — Railway deployment with Bearer token auth",
+  "type": "module",
+  "scripts": {
+    "start": "sh start.sh"
+  },
+  "dependencies": {
+    "@brave/brave-search-mcp-server": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
